@@ -1,0 +1,235 @@
+#!/bin/bash
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+# Keeps the Mac awake with the lid shut while an agent session is working.
+# macOS ignores PreventSystemSleep on battery, so the only lever that survives
+# a clamshell close is the root-only pmset disablesleep flag.
+
+AGENTS_REGEX='(^|/)(claude|codex)( |$)'
+CODEX_ASSERTION='Codex is running an active turn'
+OMP_ASSERTION='Oh My Pi agent session'
+GRACE_SECONDS=600
+FLOOR_OFF=20
+FLOOR_ON=25
+STATE_DIR=${AGENTAWAKE_STATE:-/var/run/agentawake}
+LOG=${AGENTAWAKE_LOG:-/var/log/agentawake.log}
+DRY_RUN=${AGENTAWAKE_DRY_RUN:-0}
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+F_ACTIVE="$STATE_DIR/last_active"
+F_DESIRED="$STATE_DIR/last_desired"
+F_TRIPPED="$STATE_DIR/floor_tripped"
+F_FAILED="$STATE_DIR/apply_failed"
+F_SOURCE="$STATE_DIR/last_source"
+
+now() { date +%s; }
+log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null; }
+read_flag() { local v; v=$(cat "$1" 2>/dev/null); case "$v" in 0|1) printf '%s' "$v" ;; *) printf '' ;; esac; }
+
+agent_working() {
+  local pid ppid pcmd assertions
+  if [ -n "${AGENTAWAKE_FAKE_AGENT:-}" ]; then
+    [ "$AGENTAWAKE_FAKE_AGENT" = none ] && return 1
+    printf '%s' "$AGENTAWAKE_FAKE_AGENT"
+    return 0
+  fi
+
+  if [ -n "${AGENTAWAKE_FAKE_CAFFEINATE_PARENT:-}" ]; then
+    pcmd=$AGENTAWAKE_FAKE_CAFFEINATE_PARENT
+    if printf '%s' "$pcmd" | grep -Eq "$AGENTS_REGEX"; then
+      printf 'caffeinate<-%s' "$(basename "$pcmd")"
+      return 0
+    fi
+  else
+    for pid in $(pgrep -x caffeinate 2>/dev/null); do
+      ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+      [ -n "$ppid" ] || continue
+      pcmd=$(ps -o comm= -p "$ppid" 2>/dev/null)
+      if printf '%s' "$pcmd" | grep -Eq "$AGENTS_REGEX"; then
+        printf 'caffeinate<-%s' "$(basename "$pcmd")"
+        return 0
+      fi
+    done
+  fi
+
+  if [ -n "${AGENTAWAKE_FAKE_ASSERTIONS+x}" ]; then
+    assertions=$AGENTAWAKE_FAKE_ASSERTIONS
+  else
+    assertions=$(pmset -g assertions 2>/dev/null)
+  fi
+  if printf '%s' "$assertions" | grep -q "$CODEX_ASSERTION"; then printf 'codex-turn'; return 0; fi
+  if printf '%s' "$assertions" | grep -q "$OMP_ASSERTION"; then printf 'omp-turn'; return 0; fi
+  return 1
+}
+
+battery_state() {
+  [ -n "$AGENTAWAKE_FAKE_BATT" ] && { printf '%s' "$AGENTAWAKE_FAKE_BATT"; return 0; }
+  local line pct source
+  line=$(pmset -g batt 2>/dev/null)
+  printf '%s' "$line" | grep -q "'AC Power'" && source=ac || source=batt
+  pct=$(printf '%s' "$line" | grep -Eo '[0-9]+%' | head -1 | tr -d '%')
+  case "$pct" in ''|*[!0-9]*) pct=100 ;; esac
+  printf '%s %s' "$source" "$pct"
+}
+
+agent_label() {
+  case "$1" in
+    *claude*) printf 'Claude Code running' ;;
+    codex-turn) printf 'Codex running' ;;
+    omp-turn) printf 'OMP running' ;;
+    *) printf 'Agent running' ;;
+  esac
+}
+
+console_user() {
+  local user
+  if [ -n "${AGENTAWAKE_FAKE_CONSOLE_USER:-}" ]; then
+    printf '%s' "$AGENTAWAKE_FAKE_CONSOLE_USER"
+    return 0
+  fi
+  user=$(stat -f%Su /dev/console 2>/dev/null)
+  [ -n "$user" ] && [ "$user" != "root" ] || return 1
+  printf '%s' "$user"
+}
+
+pager_path() {
+  local user="$1" home candidate
+  if [ -n "${AGENTAWAKE_PAGER+x}" ]; then
+    [ -x "$AGENTAWAKE_PAGER" ] || return 1
+    printf '%s' "$AGENTAWAKE_PAGER"
+    return 0
+  fi
+
+  home=$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null)
+  home=${home#*: }
+  [ -n "$home" ] || home="/Users/$user"
+  for candidate in "$home/.local/bin/pager" /opt/homebrew/bin/pager /usr/local/bin/pager; do
+    if [ -x "$candidate" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+run_pager() {
+  local user uid pager
+  user=$(console_user) || return 0
+  uid=$(id -u "$user" 2>/dev/null) || return 0
+  pager=$(pager_path "$user") || { log "pager not installed; notification skipped"; return 0; }
+  if [ "$(id -u)" = 0 ]; then
+    launchctl asuser "$uid" sudo -u "$user" "$pager" "$@" >/dev/null 2>&1 &
+  else
+    "$pager" "$@" >/dev/null 2>&1 &
+  fi
+}
+
+panel() {
+  run_pager "$@"
+}
+
+sleep_disabled_now() {
+  [ -n "$AGENTAWAKE_FAKE_CURRENT" ] && { printf '%s' "$AGENTAWAKE_FAKE_CURRENT"; return 0; }
+  pmset -g 2>/dev/null | grep -qE 'SleepDisabled[[:space:]]+1' && printf 1 || printf 0
+}
+
+notify() {
+  local title="$1" accent="$2" sound="$3" body="$4" pinned="$5"
+  local args=( --title "$title" --app agentawake --icon moon.zzz --corner top-right
+               --accent "$accent" --sound "$sound" --body "$body"
+               --action "Log:open -e $LOG" )
+  [ "$pinned" = pinned ] && args+=( --pinned ) || args+=( --seconds 20 )
+  run_pager "${args[@]}"
+}
+
+apply() {
+  local want="$1" err after
+  if [ "$DRY_RUN" = 1 ]; then echo "[dry-run] would set disablesleep=$want"; return 0; fi
+  err=$(pmset -a disablesleep "$want" 2>&1 >/dev/null)
+  if [ -n "$err" ]; then log "pmset error setting disablesleep=$want: $err"; return 1; fi
+  after=$(sleep_disabled_now)
+  if [ "$after" != "$want" ]; then log "pmset set disablesleep=$want but it reads back $after"; return 1; fi
+  return 0
+}
+
+main() {
+  local who src pct current desired reason last_active age last_desired tripped failed last_src
+  read -r src pct <<<"$(battery_state)"
+  case "$pct" in ''|*[!0-9]*) pct=100 ;; esac
+  current=$(sleep_disabled_now)
+  last_active=$(cat "$F_ACTIVE" 2>/dev/null)
+  case "$last_active" in ''|*[!0-9]*) last_active=0 ;; esac
+  last_desired=$(read_flag "$F_DESIRED")
+  tripped=$(read_flag "$F_TRIPPED"); [ -n "$tripped" ] || tripped=0
+  failed=$(read_flag "$F_FAILED"); [ -n "$failed" ] || failed=0
+  last_src=$(cat "$F_SOURCE" 2>/dev/null)
+
+  if who=$(agent_working); then now > "$F_ACTIVE"; last_active=$(now); fi
+  age=$(( $(now) - last_active ))
+
+  if [ "$src" = ac ]; then
+    tripped=0
+  elif [ "$tripped" = 1 ]; then
+    [ "$pct" -ge "$FLOOR_ON" ] && tripped=0
+  elif [ "$pct" -lt "$FLOOR_OFF" ]; then
+    tripped=1
+  fi
+  printf '%s' "$tripped" > "$F_TRIPPED"
+
+  if [ "$tripped" = 1 ]; then
+    desired=0; reason="battery ${pct}%, floor tripped, needs ${FLOOR_ON}% to resume"
+  elif [ -n "$who" ]; then
+    desired=1; reason="agent working (${who})"
+  elif [ "$last_active" -gt 0 ] && [ "$age" -lt "$GRACE_SECONDS" ]; then
+    desired=1; reason="grace, ${age}s since last agent"
+  else
+    desired=0; reason="no agents"
+  fi
+
+  echo "src=$src pct=$pct current=$current desired=$desired last=${last_desired:-none} tripped=$tripped reason=$reason"
+
+  if [ "$desired" != "$current" ]; then
+    if ! apply "$desired"; then
+      if [ "$failed" = 0 ]; then
+        printf 1 > "$F_FAILED"
+        notify "Cannot control sleep" "#ff5f57" alarm \
+          "pmset refused to set disablesleep=${desired}. Lid-close behaviour is whatever macOS decides, so do not rely on it. See the log." pinned
+      fi
+      return 1
+    fi
+  fi
+  [ "$failed" = 1 ] && { printf 0 > "$F_FAILED"; log "pmset working again"; }
+
+  printf '%s' "$src" > "$F_SOURCE"
+  if [ "$last_src" = ac ] && [ "$src" = batt ]; then
+    if [ "$desired" = 1 ]; then
+      panel --app agentawake --icon bolt.slash.fill --corner top-right --width 460 \
+        --accent "#c8ff00" --sound tick --pinned \
+        --source "Power unplugged" \
+        --title "**Safe to close the lid.**" \
+        --chip "$(agent_label "$who")" \
+        --chip "Cutoff at ${FLOOR_OFF}%" \
+        --body "Your Mac will stay awake with the lid shut so the agent can finish. If the battery drops to ${FLOOR_OFF}%, sleep turns back on." \
+        --action "Log:open -e $LOG" --action-icon doc.text
+    else
+      panel --app agentawake --icon moon.fill --corner top-right --width 460 \
+        --accent "#3b8eea" --sound thump --pinned \
+        --source "Power unplugged" \
+        --title "**No agents running.**" \
+        --chip "Mac will sleep on lid close" \
+        --body "Nothing is active. Closing the lid puts the Mac to sleep as usual." \
+        --action "Dismiss:"
+    fi
+  fi
+
+  printf '%s' "$desired" > "$F_DESIRED"
+  [ "$desired" = "$last_desired" ] && return 0
+  log "disablesleep -> $desired  ($reason)"
+  [ -n "$last_desired" ] || return 0
+
+  if [ "$desired" = 0 ] && [ "$tripped" = 1 ]; then
+    notify "Battery at ${pct}%, sleep allowed again" "#febc2e" fall \
+      "Below the ${FLOOR_OFF}% floor, so lid-close sleep is back on. An agent session will stop if you shut the lid. Plug in, or charge to ${FLOOR_ON}%, to resume." pinned
+  fi
+}
+
+main "$@"

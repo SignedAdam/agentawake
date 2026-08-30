@@ -1,0 +1,8 @@
+#!/bin/bash
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+TARGET=/usr/local/libexec/agentawake
+pmset -g pslog 2>/dev/null | while IFS= read -r line; do
+  case "$line" in
+    *"Now drawing from"*) "$TARGET" >/dev/null 2>&1 ;;
+  esac
+done
