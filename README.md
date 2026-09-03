@@ -34,7 +34,7 @@ Idle agent windows do not keep the machine awake.
 
 ### Cooldown and battery thresholds
 
-- **10-minute cooldown:** Sleep stays disabled for 10 minutes after the last active turn, then returns to normal.
+- **20-minute cooldown:** Sleep stays disabled for 20 minutes after the last active turn, then returns to normal.
 - **Below 20% cutoff:** On battery, sleep is restored when the charge falls below 20%, even if an agent is still working.
 - **25% resume threshold:** After the cutoff trips, agent work can disable sleep again once the battery reaches 25%. The gap prevents repeated switching around one battery percentage.
 

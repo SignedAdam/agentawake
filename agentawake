@@ -7,7 +7,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin
 AGENTS_REGEX='(^|/)(claude|codex)( |$)'
 CODEX_ASSERTION='Codex is running an active turn'
 OMP_ASSERTION='Oh My Pi agent session'
-GRACE_SECONDS=600
+GRACE_SECONDS=1200
 FLOOR_OFF=20
 FLOOR_ON=25
 STATE_DIR=${AGENTAWAKE_STATE:-/var/run/agentawake}
@@ -20,6 +20,11 @@ F_DESIRED="$STATE_DIR/last_desired"
 F_TRIPPED="$STATE_DIR/floor_tripped"
 F_FAILED="$STATE_DIR/apply_failed"
 F_SOURCE="$STATE_DIR/last_source"
+LOCK_FILE="$STATE_DIR/run.lock"
+
+if [ "${AGENTAWAKE_LOCKED:-0}" != 1 ]; then
+  exec /usr/bin/lockf -s -k "$LOCK_FILE" /usr/bin/env AGENTAWAKE_LOCKED=1 "$0" "$@"
+fi
 
 now() { date +%s; }
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null; }
