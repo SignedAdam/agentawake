@@ -33,11 +33,15 @@ assert_equals() {
   fi
 }
 
-run_detector() {
-  local name="$1" expected="$2" parent="$3" assertions="$4" state output
+# Every detector run gets a user home so the tests never read the real ~/.hermes.
+DETECT_HOME="$TMP/home-empty"
+mkdir -p "$DETECT_HOME"
+
+detect() {
+  local name="$1" parent="$2" assertions="$3" state
   state="$TMP/$name"
   mkdir -p "$state"
-  output=$(env \
+  env \
     AGENTAWAKE_DRY_RUN=1 \
     AGENTAWAKE_STATE="$state" \
     AGENTAWAKE_LOG="$state/log" \
@@ -45,13 +49,64 @@ run_detector() {
     AGENTAWAKE_FAKE_CURRENT=0 \
     AGENTAWAKE_FAKE_CAFFEINATE_PARENT="$parent" \
     AGENTAWAKE_FAKE_ASSERTIONS="$assertions" \
-    "$ROOT/agentawake")
-  assert_contains "$name detector" "$output" "reason=agent working ($expected)"
+    AGENTAWAKE_USER_HOME="$DETECT_HOME" \
+    "$ROOT/agentawake"
+}
+
+run_detector() {
+  assert_contains "$1 detector" "$(detect "$1" "$3" "$4")" "reason=agent working ($2)"
+}
+
+run_idle() {
+  assert_contains "$1 allows sleep" "$(detect "$1" '/usr/bin/not-an-agent' "$2")" 'reason=no agents'
 }
 
 run_detector claude 'caffeinate<-claude' '/usr/local/bin/claude' ''
 run_detector codex 'codex-turn' '/usr/bin/not-an-agent' 'Codex is running an active turn'
-run_detector omp 'omp-turn' '/usr/bin/not-an-agent' 'Oh My Pi agent session'
+run_detector omp 'omp-turn' '/usr/bin/not-an-agent' \
+  'pid 81187(omp): [0x000fe13200018919] 00:00:46 PreventUserIdleSystemSleep named: "omp agent session"'
+run_detector amphetamine 'amphetamine' '/usr/bin/not-an-agent' \
+  'pid 61081(Amphetamine): [0x000e98e90001a300] 00:09:29 PreventUserIdleSystemSleep named: "Amphetamine (Single-Use - System)"'
+
+# gateway_state HOME PROFILE ACTIVE PID   (empty PROFILE = the default ~/.hermes)
+gateway_state() {
+  local dir="$1/.hermes"
+  [ -n "$2" ] && dir="$dir/profiles/$2"
+  mkdir -p "$dir"
+  printf '{"pid": %s, "active_agents": %s, "gateway_state": "running"}\n' "$4" "$3" > "$dir/gateway_state.json"
+}
+
+DETECT_HOME="$TMP/home-hermes-busy"
+gateway_state "$DETECT_HOME" '' 0 $$
+gateway_state "$DETECT_HOME" narkis 1 $$
+run_detector hermes-gateway 'hermes-gateway:narkis' '/usr/bin/not-an-agent' ''
+
+DETECT_HOME="$TMP/home-hermes-idle"
+gateway_state "$DETECT_HOME" '' 0 $$
+gateway_state "$DETECT_HOME" narkis 0 $$
+run_idle hermes-idle-gateways ''
+
+sleep 0 & dead_pid=$!
+wait "$dead_pid"
+DETECT_HOME="$TMP/home-hermes-dead"
+gateway_state "$DETECT_HOME" narkis 1 "$dead_pid"
+run_idle hermes-dead-gateway ''
+
+DETECT_HOME="$TMP/home-hermes-stale"
+gateway_state "$DETECT_HOME" narkis 1 $$
+touch -A -2000 "$DETECT_HOME/.hermes/profiles/narkis/gateway_state.json"
+run_idle hermes-stale-gateway ''
+
+desktop_blocker='pid 9438(Hermes): [0x0008c32300019c17] 01:00:00 NoIdleSleepAssertion named: "Electron"'
+DETECT_HOME="$TMP/home-desktop-working"
+mkdir -p "$DETECT_HOME/Library/Application Support/Hermes"
+printf '{"mode": "while-working"}' > "$DETECT_HOME/Library/Application Support/Hermes/keep-awake.json"
+run_detector hermes-desktop 'hermes-desktop' '/usr/bin/not-an-agent' "$desktop_blocker"
+
+DETECT_HOME="$TMP/home-desktop-always"
+mkdir -p "$DETECT_HOME/Library/Application Support/Hermes"
+printf '{"mode": "always"}' > "$DETECT_HOME/Library/Application Support/Hermes/keep-awake.json"
+run_idle hermes-desktop-always "$desktop_blocker"
 
 state="$TMP/idle"
 mkdir -p "$state"

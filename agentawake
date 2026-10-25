@@ -6,7 +6,10 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 AGENTS_REGEX='(^|/)(claude|codex)( |$)'
 CODEX_ASSERTION='Codex is running an active turn'
-OMP_ASSERTION='Oh My Pi agent session'
+OMP_ASSERTION='omp agent session'
+HERMES_DESKTOP_ASSERTION='\(Hermes\): .*named: "Electron"'
+AMPHETAMINE_ASSERTION='PreventUserIdleSystemSleep named: "Amphetamine'
+HERMES_STALE_SECONDS=600
 GRACE_SECONDS=1200
 FLOOR_OFF=20
 FLOOR_ON=25
@@ -30,8 +33,40 @@ now() { date +%s; }
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null; }
 read_flag() { local v; v=$(cat "$1" 2>/dev/null); case "$v" in 0|1) printf '%s' "$v" ;; *) printf '' ;; esac; }
 
+# Every Hermes gateway publishes its in-flight work (chat turns, cron jobs, API
+# runs) as active_agents in gateway_state.json at each turn boundary and
+# re-stamps the file every 60s. Busy means what Hermes itself means by it: the
+# gateway pid is alive and active_agents > 0. A file not touched for ten
+# minutes belongs to a wedged or vanished gateway, whose pid may be reused.
+hermes_gateway_working() {
+  local home="$1" f n pid age profile
+  for f in "$home/.hermes/gateway_state.json" "$home"/.hermes/profiles/*/gateway_state.json; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    n=$(plutil -extract active_agents raw -o - "$f" 2>/dev/null)
+    case "$n" in ''|*[!0-9]*) continue ;; esac
+    [ "$n" -gt 0 ] || continue
+    pid=$(plutil -extract pid raw -o - "$f" 2>/dev/null)
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || continue
+    age=$(( $(now) - $(stat -f %m "$f") ))
+    [ "$age" -lt "$HERMES_STALE_SECONDS" ] || continue
+    profile=$(basename "$(dirname "$f")")
+    [ "$profile" = .hermes ] && profile=default
+    printf 'hermes-gateway:%s' "$profile"
+    return 0
+  done
+  return 1
+}
+
+# Hermes desktop holds an Electron power-save blocker. In its "While working"
+# mode the blocker exists only while a turn is in flight; in "Always" it never
+# drops, so it says nothing about work and is ignored.
+hermes_desktop_mode() {
+  plutil -extract mode raw -o - "$1/Library/Application Support/Hermes/keep-awake.json" 2>/dev/null
+}
+
 agent_working() {
-  local pid ppid pcmd assertions
+  local pid ppid pcmd assertions home found
   if [ -n "${AGENTAWAKE_FAKE_AGENT:-}" ]; then
     [ "$AGENTAWAKE_FAKE_AGENT" = none ] && return 1
     printf '%s' "$AGENTAWAKE_FAKE_AGENT"
@@ -63,6 +98,19 @@ agent_working() {
   fi
   if printf '%s' "$assertions" | grep -q "$CODEX_ASSERTION"; then printf 'codex-turn'; return 0; fi
   if printf '%s' "$assertions" | grep -q "$OMP_ASSERTION"; then printf 'omp-turn'; return 0; fi
+
+  if home=$(console_home); then
+    if found=$(hermes_gateway_working "$home"); then printf '%s' "$found"; return 0; fi
+    if [ "$(hermes_desktop_mode "$home")" = while-working ] &&
+       printf '%s' "$assertions" | grep -Eq "$HERMES_DESKTOP_ASSERTION"; then
+      printf 'hermes-desktop'
+      return 0
+    fi
+  fi
+
+  # An Amphetamine session is the manual switch: Amphetamine cannot hold a
+  # closed lid open on battery from inside the App Store sandbox, so we do it.
+  if printf '%s' "$assertions" | grep -q "$AMPHETAMINE_ASSERTION"; then printf 'amphetamine'; return 0; fi
   return 1
 }
 
@@ -81,6 +129,8 @@ agent_label() {
     *claude*) printf 'Claude Code running' ;;
     codex-turn) printf 'Codex running' ;;
     omp-turn) printf 'OMP running' ;;
+    hermes-*) printf 'Hermes running' ;;
+    amphetamine) printf 'Amphetamine session' ;;
     *) printf 'Agent running' ;;
   esac
 }
@@ -96,6 +146,24 @@ console_user() {
   printf '%s' "$user"
 }
 
+user_home() {
+  local home
+  home=$(dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null)
+  home=${home#*: }
+  [ -n "$home" ] || home="/Users/$1"
+  printf '%s' "$home"
+}
+
+console_home() {
+  local user
+  if [ -n "${AGENTAWAKE_USER_HOME:-}" ]; then
+    printf '%s' "$AGENTAWAKE_USER_HOME"
+    return 0
+  fi
+  user=$(console_user) || return 1
+  user_home "$user"
+}
+
 pager_path() {
   local user="$1" home candidate
   if [ -n "${AGENTAWAKE_PAGER+x}" ]; then
@@ -104,9 +172,7 @@ pager_path() {
     return 0
   fi
 
-  home=$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null)
-  home=${home#*: }
-  [ -n "$home" ] || home="/Users/$user"
+  home=$(user_home "$user")
   for candidate in "$home/.local/bin/pager" /opt/homebrew/bin/pager /usr/local/bin/pager; do
     if [ -x "$candidate" ]; then
       printf '%s' "$candidate"

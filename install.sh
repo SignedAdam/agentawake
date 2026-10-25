@@ -26,7 +26,7 @@ mkdir -p /usr/local/libexec
 chown root:wheel /usr/local/libexec
 chmod 755 /usr/local/libexec
 
-echo "preflight 2: root runs this file every 30s, so nothing but root may write to it or its parents"
+echo "preflight 2: root runs this file every 10s, so nothing but root may write to it or its parents"
 bad=0
 p=$(dirname "$TARGET")
 while [ "$p" != "/" ]; do

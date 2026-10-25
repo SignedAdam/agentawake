@@ -5,7 +5,7 @@
   <key>Label</key><string>com.albastov.agentawake</string>
   <key>ProgramArguments</key>
   <array><string>/usr/local/libexec/agentawake</string></array>
-  <key>StartInterval</key><integer>30</integer>
+  <key>StartInterval</key><integer>10</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardErrorPath</key><string>/var/log/agentawake.err</string>
 </dict>

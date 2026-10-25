@@ -1,6 +1,6 @@
 # agentawake
 
-`agentawake` is a root LaunchDaemon for macOS laptops. It keeps the machine awake while Claude Code, Codex, or Oh My Pi (OMP) are actively running turns, even when the lid is closed on battery power.
+`agentawake` is a root LaunchDaemon for macOS laptops. It keeps the machine awake while Claude Code, Codex, Oh My Pi (OMP), or Hermes are actively running turns, or while an Amphetamine session is running, even when the lid is closed on battery power.
 
 ## Why standard tools fail on battery
 
@@ -24,13 +24,16 @@ When active turns finish, `agentawake` turns sleep back on.
 
 ### Agent detection
 
-`agentawake` checks for active work every 30 seconds and reacts immediately when the power source changes:
+`agentawake` checks for active work every 10 seconds and reacts immediately when the power source changes:
 
 - **Claude Code:** Detects the active `caffeinate` child created while a turn runs.
 - **Codex:** Detects the `Codex is running an active turn` power assertion.
-- **Oh My Pi (OMP):** Detects the `Oh My Pi agent session` power assertion.
+- **Oh My Pi (OMP):** Detects the `omp agent session` power assertion, held only while a turn is in flight.
+- **Hermes gateways:** Reads `active_agents` from every `gateway_state.json` under the logged-in user's `~/.hermes` (default and `profiles/*`). The gateway rewrites it at each turn boundary, so it covers chat turns, cron jobs, and API runs. A gateway counts only while its pid is alive and the file was touched in the last 10 minutes.
+- **Hermes desktop:** Detects the app's `Electron` power assertion, but only when **Keep computer awake** is set to **While working**. In **Always** mode the assertion never drops and is ignored.
+- **Amphetamine:** Any running Amphetamine session counts. Amphetamine cannot hold a closed lid open on battery from inside the App Store sandbox, so `agentawake` does it for it.
 
-Idle agent windows do not keep the machine awake.
+Idle agent windows do not keep the machine awake. Hermes CLI chats run their agent in-process and publish no signal, so they are not detected.
 
 ### Cooldown and battery thresholds
 
